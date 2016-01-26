@@ -1,20 +1,33 @@
 import re
 try:
     from httplib import OK
-    from urlparse import urljoin
+    from urlparse import urljoin, unquote
 except ImportError:  # Python3
     from http.client import OK
-    from urllib.parse import urljoin
+    from urllib.parse import urljoin, unquote
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 import requests
+from logging import getLogger
+from decimal import Decimal
+try:  # Try to import a smarter datetime
+    from django.utils import timezone as datetime
+except ImportError:
+    from datetime import datetime
+from datetime import timedelta
 
 from scrapezillow import constants
+
+logger = getLogger(__name__)
+
+
+class NullResultException(Exception):
+    pass
 
 
 def _check_for_null_result(result):
     if not result:
-        raise Exception(
+        raise NullResultException(
             "We were unable to parse crucial facts for this home. Perhaps this is "
             "not a valid listing or the html changed and we are unable to use the "
             "scraper. If the latter, file a bug at https://github.com/hahnicity/scrapezillow/issues"
@@ -79,11 +92,12 @@ def _get_photos(soup):
     photos = [i.get("href", i.get("src", None)) for i in images]
     return filter(None, photos)
 
+
 def _get_fact_list(soup):
     groups = soup.find_all("ul", constants.FACT_GROUPING)
     facts = []
     for group in groups:
-        facts.extend(group.find_all(class_=constants.INDIVIDUAL_FACT))
+        facts.extend(group.find_all('li'))
     return facts
 
 
@@ -100,6 +114,12 @@ def _parse_facts(facts):
             if not "extras" in parsed_facts:
                 parsed_facts["extras"] = []
             parsed_facts["extras"].append(fact.text)
+        elif "Posted" in fact.text:
+            string = re.sub("( #|# )", "", fact.text)
+            split = string.split(":")
+            days = split[1].strip().split(" ")[0]
+            posted_date = datetime.now() - timedelta(days=int(days))
+            parsed_facts['posted'] = posted_date
         else:
             string = re.sub("( #|# )", "", fact.text)
             split = string.split(":")
@@ -108,8 +128,8 @@ def _parse_facts(facts):
     return parsed_facts
 
 
-def get_raw_html(url, timeout):
-    response = requests.get(url, timeout=timeout)
+def get_raw_html(url, timeout, request_class):
+    response = request_class.get(url, timeout=timeout)
     if response.status_code != OK:
         raise Exception("You received a {} error. Your content {}".format(
             response.status_code, response.content
@@ -136,6 +156,47 @@ def validate_scraper_input(url, zpid):
     return url or urljoin(constants.ZILLOW_URL, "homes/{}_zpid/(index)/".format(zpid))
 
 
+def _get_location_data(soup):
+    """
+    Gets coordinates from hidden comment (zillow doesnt like showing coords, probably to prevent scrapers)
+
+    :param soup: BS4 object with zillow listing data
+    :return: tuple with (latitude, longitude)
+    """
+    location_data_div = soup.find('div', {'class': 'homeMarkerData'})
+    if location_data_div:
+        comments = location_data_div.find(text=lambda text: isinstance(text, Comment))
+        parsed_comments = comments.string.strip('[').strip(']').split(',')
+        try:
+            lat = Decimal(Decimal(parsed_comments[-2]) / Decimal(1e6))
+            lon_str = ''.join([a for a in parsed_comments[-1] if '\\' not in a])
+            lon = Decimal(Decimal(lon_str) / Decimal(1e6))
+        except Exception:
+            lat = None
+            lon = None
+    else:
+        lat = None
+        lon = None
+
+    location_data_elem = soup.find(id="hdp-map-coordinates")
+    if not lat:
+        lat = location_data_elem.attrs['data-latitude']
+    if not lon:
+        lon = location_data_elem.attrs['data-longitude']
+    try:
+        addr_url = location_data_elem.attrs['data-direction']
+        addr_url = unquote(addr_url)
+        addr_substr = addr_url[addr_url.index('addr=')+5:]
+        addr_substr = addr_substr[:addr_substr.index('&')]
+        addr_substr = addr_substr.replace('+', ' ').replace(' ,', ', ')
+        if addr_substr[-5] == '-':
+            addr_substr = addr_substr[:-5]
+    except Exception:
+        addr_substr = None
+
+    return {'latitude': lat, 'longitude': lon, 'address': addr_substr}
+
+
 def _get_ajax_url(soup, label):
     pattern = r"(\/AjaxRender.htm\?encparams=[\w\-_~=]+&rwebid=\d+&rhost=\d)\",customEvent:\"CollapsibleModule:expandSection\",jsModule:\"{}".format(label)
     url = re.search(pattern, soup.text)
@@ -144,8 +205,8 @@ def _get_ajax_url(soup, label):
     return ajax_url
 
 
-def _get_table_body(ajax_url, request_timeout):
-    html = get_raw_html(ajax_url, request_timeout)
+def _get_table_body(ajax_url, request_timeout, request_class=requests):
+    html = get_raw_html(ajax_url, request_timeout, request_class)
     pattern = r' { "html": "(.*)" }'
     html = re.search(pattern, str(html)).group(1)
     html = re.sub(r'\\"', r'"', html)  # Correct escaped quotes
@@ -158,8 +219,8 @@ def _get_table_body(ajax_url, request_timeout):
     return table_body
 
 
-def _get_price_history(ajax_url, request_timeout):
-    table_body = _get_table_body(ajax_url, request_timeout)
+def _get_price_history(ajax_url, request_timeout, request_class=requests):
+    table_body = _get_table_body(ajax_url, request_timeout, request_class)
     data = []
 
     rows = table_body.find_all('tr')
@@ -168,7 +229,10 @@ def _get_price_history(ajax_url, request_timeout):
         cols = [ele for ele in cols]
         date = cols[0].get_text()
         event = cols[1].get_text()
-        price_span = cols[2].find('span')
+        try:
+            price_span = cols[2].find('span')
+        except IndexError:
+            price_span = None
         if not price_span:
             price = None
         else:
@@ -178,10 +242,10 @@ def _get_price_history(ajax_url, request_timeout):
     return data
 
 
-def _get_tax_history(ajax_url, request_timeout):
+def _get_tax_history(ajax_url, request_timeout, request_class=requests):
     data = []
     try:
-        table_body = _get_table_body(ajax_url, request_timeout)
+        table_body = _get_table_body(ajax_url, request_timeout, request_class)
     except ValueError:
         return data
 
@@ -197,25 +261,44 @@ def _get_tax_history(ajax_url, request_timeout):
     return data
 
 
-def populate_price_and_tax_histories(soup, results, request_timeout):
-    history_url = _get_ajax_url(soup, "z-hdp-price-history")
-    results["price_history"] = _get_price_history(history_url, request_timeout)
-    tax_url = _get_ajax_url(soup, "z-expando-table")
-    results["tax_history"] = _get_tax_history(tax_url, request_timeout)
+def populate_price_and_tax_histories(soup, results, request_timeout, request_class=requests):
+    try:
+        history_url = _get_ajax_url(soup, "z-hdp-price-history")
+        results["price_history"] = _get_price_history(history_url, request_timeout, request_class)
+    except NullResultException as e:
+        print('Unable to get price history.  Perhaps this is not a valid listing or the html changed and we are unable '
+              'to use the scraper. If the latter, file a bug at https://github.com/hahnicity/scrapezillow/issues')
+        logger.exception(e)
+    try:
+        tax_url = _get_ajax_url(soup, "z-expando-table")
+        results["tax_history"] = _get_tax_history(tax_url, request_timeout, request_class)
+    except NullResultException as e:
+        print('Unable to get tax history.  Perhaps this is not a valid listing or the html changed and we are unable '
+              'to use the scraper. If the latter, file a bug at https://github.com/hahnicity/scrapezillow/issues')
+        logger.exception(e)
 
 
-def scrape_url(url, zpid, request_timeout):
+def scrape_url(url=None, zpid=None, request_timeout=10, request_class=requests, get_price_and_tax_info=True):
     """
     Scrape a specific zillow home. Takes either a url or a zpid. If both/neither are
     specified this function will throw an error.
+
+    :param url: Optional string URL to crawl    (XOR with zpid)
+    :param zpid: Optional zillow ID to use      (XOR with url)
+    :param request_timeout: Optional the timeout param to pass to the request class
+    :param request_class: Optional the request class to use. Defaults to requests. Class must have get method.
+
+    :return results: Dict object with information about zillow listing.
     """
     url = validate_scraper_input(url, zpid)
-    soup = BeautifulSoup(get_raw_html(url, request_timeout), 'html.parser')
+    soup = BeautifulSoup(get_raw_html(url, request_timeout, request_class), 'html.parser')
     results = _get_property_summary(soup)
     facts = _parse_facts(_get_fact_list(soup))
     results.update(**facts)
     results.update(**_get_sale_info(soup))
     results["description"] = _get_description(soup)
     results["photos"] = _get_photos(soup)
-    populate_price_and_tax_histories(soup, results, request_timeout)
+    results["location_data"] = _get_location_data(soup)
+    if get_price_and_tax_info:
+        populate_price_and_tax_histories(soup, results, request_timeout, request_class)
     return results

@@ -1,5 +1,5 @@
 DESCRIPTION = "notranslate"
-FACT_GROUPING = "disc-bullet"
+FACT_GROUPING = "zsg-list_square"
 HOME_TYPES = (
     "Apartment",
     "Condo",
